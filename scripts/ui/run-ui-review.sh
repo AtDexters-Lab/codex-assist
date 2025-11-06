@@ -194,6 +194,7 @@ fi
 
 declare -a IMAGE_PATHS=()
 declare -a IMAGE_LABELS=()
+declare -a IMAGE_DIRS=()
 declare -a SEEN_IMAGES=()
 
 shopt -s nocasematch
@@ -218,7 +219,8 @@ collect_image() {
     return
   fi
   if [[ ! -f "$img_path" ]]; then
-    return
+    echo "Error: image file not found: $img_path" >&2
+    exit 1
   fi
   if [[ ! "$img_path" =~ $image_ext_regex ]]; then
     echo "Skipping non-image file: $img_path" >&2
@@ -226,12 +228,17 @@ collect_image() {
   fi
   local abs_path
   abs_path="$(cd "$(dirname "$img_path")" && pwd)/$(basename "$img_path")"
+  if [[ ! -r "$abs_path" ]]; then
+    echo "Error: unable to read image file: $abs_path" >&2
+    exit 1
+  fi
   if image_already_seen "$abs_path"; then
     return
   fi
   SEEN_IMAGES+=("$abs_path")
   IMAGE_PATHS+=("$abs_path")
   IMAGE_LABELS+=("$label")
+  IMAGE_DIRS+=("$(dirname "$abs_path")")
 }
 
 for target in "${TARGET_PATHS[@]}"; do
@@ -263,6 +270,21 @@ if [[ ${#IMAGE_PATHS[@]} -eq 0 ]]; then
   exit 1
 fi
 
+WORKDIR="$INVOCATION_PWD"
+if [[ ${#IMAGE_DIRS[@]} -gt 0 ]]; then
+  candidate_dir="${IMAGE_DIRS[0]}"
+  same_dir="true"
+  for dir in "${IMAGE_DIRS[@]}"; do
+    if [[ "$dir" != "$candidate_dir" ]]; then
+      same_dir="false"
+      break
+    fi
+  done
+  if [[ "$same_dir" == "true" ]]; then
+    WORKDIR="$candidate_dir"
+  fi
+fi
+
 if [[ "$PROMPT_FILE" != "-" ]]; then
   if [[ ! -f "$PROMPT_FILE" ]]; then
     echo "Error: prompt file not found: $PROMPT_FILE" >&2
@@ -291,14 +313,38 @@ if [[ ${#CONTEXT_FILES[@]} -gt 0 ]]; then
 fi
 
 ATTACHMENT_LIST=""
-for label in "${IMAGE_LABELS[@]}"; do
-  ATTACHMENT_LIST+=" - $label"$'\n'
+for idx in "${!IMAGE_PATHS[@]}"; do
+  label="${IMAGE_LABELS[$idx]}"
+  abs_path="${IMAGE_PATHS[$idx]}"
+  rel_display="$label"
+  if [[ "$abs_path" == "$WORKDIR"/* ]]; then
+    rel_candidate="${abs_path#"$WORKDIR"/}"
+    if [[ -n "$rel_candidate" ]]; then
+      rel_display="$rel_candidate"
+    fi
+  elif [[ "$abs_path" == "$INVOCATION_PWD"/* ]]; then
+    rel_candidate="${abs_path#"$INVOCATION_PWD"/}"
+    if [[ -n "$rel_candidate" ]]; then
+      rel_display="$rel_candidate"
+    fi
+  elif [[ "$abs_path" == "$REPO_ROOT"/* ]]; then
+    rel_candidate="${abs_path#"$REPO_ROOT"/}"
+    if [[ -n "$rel_candidate" ]]; then
+      rel_display="$rel_candidate"
+    fi
+  fi
+  if [[ "$rel_display" != "$label" ]]; then
+    ATTACHMENT_LIST+=" - $label (relative: $rel_display)"$'\n'
+  else
+    ATTACHMENT_LIST+=" - $label"$'\n'
+  fi
 done
 
 read -r -d '' CONTEXT_TEXT <<EOF || true
-Provided image paths (${#IMAGE_PATHS[@]} total):
+The following ${#IMAGE_PATHS[@]} screenshot(s) are already attached to this review session. Reference each image using the label shown below.
+
 $ATTACHMENT_LIST
-Reference files using the relative names shown above.
+Reference files using the labels above.
 EOF
 
 FINAL_PROMPT="$PROMPT_BODY
@@ -311,6 +357,10 @@ if [[ -n "$OUTPUT_FILE" ]]; then
   OUTPUT_ARGS=("--output-last-message" "$OUTPUT_FILE")
 fi
 
+if [[ "$WORKDIR" != "$INVOCATION_PWD" ]]; then
+  echo "UI review working directory set to: $WORKDIR" >&2
+fi
+
 IMAGE_ARGS=()
 for img_path in "${IMAGE_PATHS[@]}"; do
   IMAGE_ARGS+=("--image" "$img_path")
@@ -321,7 +371,7 @@ codex exec \
   --model "$MODEL" \
   --skip-git-repo-check \
   --sandbox read-only \
-  --cd "$INVOCATION_PWD" \
+  --cd "$WORKDIR" \
   "${IMAGE_ARGS[@]}" \
   "${OUTPUT_ARGS[@]}" \
   -- - <<PROMPT_EOF
